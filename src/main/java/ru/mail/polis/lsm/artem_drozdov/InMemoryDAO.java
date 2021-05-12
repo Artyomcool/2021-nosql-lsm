@@ -9,10 +9,11 @@ import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 
 public class InMemoryDAO implements DAO {
 
-    private final SortedMap<ByteBuffer, Record> storage = new TreeMap<>();
+    private final SortedMap<ByteBuffer, Record> storage = new ConcurrentSkipListMap<>();
 
     @Override
     public Iterator<Record> range(@Nullable ByteBuffer fromKey, @Nullable ByteBuffer toKey) {
