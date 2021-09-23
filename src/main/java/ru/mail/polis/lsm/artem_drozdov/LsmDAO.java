@@ -8,12 +8,15 @@ import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.lang.ref.Cleaner;
+import java.lang.ref.PhantomReference;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.NavigableMap;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.SortedMap;
@@ -22,21 +25,18 @@ import java.util.concurrent.ConcurrentSkipListMap;
 
 public class LsmDAO implements DAO {
 
-    private final SortedMap<ByteBuffer, Record> memoryStorage = new ConcurrentSkipListMap<>();
+    private NavigableMap<ByteBuffer, Record> memoryStorage = newStorage();
     private final ConcurrentLinkedDeque<SSTable> tables = new ConcurrentLinkedDeque<>();
 
     @SuppressWarnings({"FieldCanBeLocal", "unused"})
     private final DAOConfig config;
 
     @GuardedBy("this")
-    private int nextSSTableIndex;
-    @GuardedBy("this")
     private int memoryConsumption;
 
     public LsmDAO(DAOConfig config) throws IOException {
         this.config = config;
         List<SSTable> ssTables = SSTable.loadFromDir(config.dir);
-        nextSSTableIndex = ssTables.size();
         tables.addAll(ssTables);
     }
 
@@ -67,6 +67,20 @@ public class LsmDAO implements DAO {
         memoryStorage.put(record.getKey(), record);
     }
 
+    @Override
+    public void closeAndCompact() throws IOException {
+        synchronized (this) {
+            SSTable table = SSTable.compact(config.dir, range(null, null));
+            tables.clear();
+            tables.add(table);
+            memoryStorage = newStorage();
+        }
+    }
+
+    private NavigableMap<ByteBuffer, Record> newStorage() {
+        return new ConcurrentSkipListMap<>();
+    }
+
     private int sizeOf(Record record) {
         return SSTable.sizeOf(record);
     }
@@ -81,12 +95,11 @@ public class LsmDAO implements DAO {
     @GuardedBy("this")
     private void flush() throws IOException {
         Path dir = config.dir;
-        Path file = dir.resolve("file_" + nextSSTableIndex); // FIXME
-        nextSSTableIndex++;
+        Path file = dir.resolve(SSTable.SSTABLE_FILE_PREFIX + tables.size());
 
         SSTable ssTable = SSTable.write(memoryStorage.values().iterator(), file);
         tables.add(ssTable);
-        memoryStorage.clear();
+        memoryStorage = new ConcurrentSkipListMap<>();
     }
 
     private Iterator<Record> sstableRanges(@Nullable ByteBuffer fromKey, @Nullable ByteBuffer toKey) {

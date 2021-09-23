@@ -5,6 +5,7 @@ import ru.mail.polis.lsm.Record;
 import javax.annotation.Nullable;
 import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -20,11 +21,14 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.stream.Stream;
 
 public class SSTable implements Closeable {
 
-    private static final Method CLEAN;
     public static final String SSTABLE_FILE_PREFIX = "file_";
+    public static final String COMPACTION_FILE_NAME = "compaction";
+
+    private static final Method CLEAN;
 
     static {
         try {
@@ -40,6 +44,10 @@ public class SSTable implements Closeable {
     private final MappedByteBuffer idx;
 
     public static List<SSTable> loadFromDir(Path dir) throws IOException {
+        Path compaction = dir.resolve(COMPACTION_FILE_NAME);
+        if (Files.exists(compaction)) {
+            finishCompaction(dir);
+        }
         List<SSTable> result = new ArrayList<>();
         for (int i = 0; ; i++) {
             Path file = dir.resolve(SSTABLE_FILE_PREFIX + i);
@@ -51,6 +59,12 @@ public class SSTable implements Closeable {
     }
 
     public static SSTable write(Iterator<Record> records, Path file) throws IOException {
+        writeImpl(records, file);
+
+        return new SSTable(file);
+    }
+
+    private static void writeImpl(Iterator<Record> records, Path file) throws IOException {
         Path indexFile = getIndexFile(file);
         Path tmpFileName = getTmpFile(file);
         Path tmpIndexName = getTmpFile(indexFile);
@@ -82,10 +96,49 @@ public class SSTable implements Closeable {
 
         rename(indexFile, tmpIndexName);
         rename(file, tmpFileName);
-
-        return new SSTable(file);
     }
 
+    public static SSTable compact(Path dir, Iterator<Record> records) throws IOException {
+        Path compaction = dir.resolve("compaction");
+        writeImpl(records, compaction);
+
+        for (int i = 0; ; i++) {
+            Path file = dir.resolve(SSTABLE_FILE_PREFIX + i);
+            if (!Files.deleteIfExists(file)) {
+                break;
+            }
+            Files.deleteIfExists(getIndexFile(file));
+        }
+
+        Path file0 = dir.resolve(SSTABLE_FILE_PREFIX + 0);
+        if (Files.exists(getIndexFile(compaction))) {
+            Files.move(getIndexFile(compaction), getIndexFile(file0), StandardCopyOption.ATOMIC_MOVE);
+        }
+        Files.move(compaction, file0, StandardCopyOption.ATOMIC_MOVE);
+        return new SSTable(file0);
+    }
+
+    private static void finishCompaction(Path dir) throws IOException {
+        try (Stream<Path> files = Files.list(dir)) {
+            files.filter(file -> file.getFileName().startsWith(SSTABLE_FILE_PREFIX))
+                    .forEach(path -> {
+                        try {
+                            Files.delete(path);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    });
+        }
+
+        Path compaction = dir.resolve(COMPACTION_FILE_NAME);
+
+        Path file0 = dir.resolve(SSTABLE_FILE_PREFIX + 0);
+        if (Files.exists(getIndexFile(compaction))) {
+            Files.move(getIndexFile(compaction), getIndexFile(file0), StandardCopyOption.ATOMIC_MOVE);
+        }
+
+        Files.move(compaction, file0, StandardCopyOption.ATOMIC_MOVE);
+    }
 
     public SSTable(Path file) throws IOException {
         Path indexFile = getIndexFile(file);
@@ -174,9 +227,9 @@ public class SSTable implements Closeable {
         channel.write(tmp);
     }
 
-    private static void rename(Path indexFile, Path tmpIndexName) throws IOException {
-        Files.deleteIfExists(indexFile);
-        Files.move(tmpIndexName, indexFile, StandardCopyOption.ATOMIC_MOVE);
+    private static void rename(Path file, Path tmpFile) throws IOException {
+        Files.deleteIfExists(file);
+        Files.move(tmpFile, file, StandardCopyOption.ATOMIC_MOVE);
     }
 
     private static MappedByteBuffer open(Path name) throws IOException {
@@ -195,27 +248,37 @@ public class SSTable implements Closeable {
         }
     }
 
-    private int offset(ByteBuffer buffer, ByteBuffer key) {
+    private int offset(ByteBuffer buffer, ByteBuffer keyToFind) {
         int left = 0;
         int rightLimit = idx.remaining() / Integer.BYTES;
         int right = rightLimit;
+
+        int keyToFindSize = keyToFind.remaining();
 
         while (left < right) {
             int mid = left + ((right - left) >>> 1);
 
             int offset = idx.getInt(mid * Integer.BYTES);
             buffer.position(offset);
-            int keySize = buffer.getInt();
+            int existingKeySize = buffer.getInt();
 
             int result;
-            int mismatch = buffer.mismatch(key);
-            if (mismatch == -1) {
+            int mismatchPos = buffer.mismatch(keyToFind);
+            if (mismatchPos == -1) {
                 return offset;
-            } else if (mismatch < keySize) {
+            }
+
+            if (existingKeySize == keyToFindSize && mismatchPos == existingKeySize) {
+                return offset;
+            }
+
+            if (mismatchPos < existingKeySize && mismatchPos < keyToFindSize) {
                 result = Byte.compare(
-                        key.get(key.position() + mismatch),
-                        buffer.get(buffer.position() + mismatch)
+                        keyToFind.get(keyToFind.position() + mismatchPos),
+                        buffer.get(buffer.position() + mismatchPos)
                 );
+            } else if (mismatchPos >= existingKeySize) {
+                result = 1;
             } else {
                 result = -1;
             }
